@@ -1,541 +1,681 @@
-﻿// I know what I'm doing when comparing floats.
-// ReSharper disable CompareOfFloatsByEqualityOperator
+#nullable enable
 
-// Debug purposes, provides ability to step through the procedure, to inspect and visualize data between each steps
-//#define YIELD_SUBSTEPS
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using Debug = UnityEngine.Debug;
+
+// ReSharper disable CompareOfFloatsByEqualityOperator - I know what I am doing, all comparisons are on purpose and take into account precision issues.
 
 namespace RealtimeCSG
 {
-    using System;
-    using System.Collections;
-    using System.Collections.Generic;
-    using System.Linq;
-    using System.Threading;
-    using UnityEditor;
-    using UnityEngine;
-    using static System.Math;
-    using Vector3 = UnityEngine.Vector3;
+	public static class CracksStitching
+	{
+		public const float DefaultMaxDist = 1e-08f;
 
-    public static class CracksStitching
-    {
-        /// <summary>
-        /// Stitch cracks and small holes in meshes, this can take a significant amount of time depending on the mesh.
-        /// </summary>
-        /// <param name="mesh"> The mesh </param>
-        /// <param name="debug"> An object which will receive debug information </param>
-        /// <param name="maxDist">The maximum distance to cover when stitching cracks, larger than this will not be stitched</param>
-        public static void Solve(Mesh mesh, ISolverDebugProvider debug = null, float maxDist = 0.05f)
-        {
-            var subMeshes = new List<int>[mesh.subMeshCount];
-            for (int i = 0; i < mesh.subMeshCount; i++)
-                subMeshes[i] = mesh.GetTriangles(i).ToList();
+		/// <summary>
+		/// Stitch cracks and small holes in meshes, this can take a significant amount of time depending on the meshes
+		/// </summary>
+		/// <param name="meshes"> The meshes to process </param>
+		/// <param name="maxDist"> The maximum distance to cover when stitching cracks, squared, holes larger than this will be left as is </param>
+		/// <param name="debugger"> Object the process will dump debug information info, can be null </param>
+		/// <param name="cancellationToken"> Token used to cancel this operation if required </param>
+		/// <param name="scenes"> The scenes which will be dertied once the process is completed </param>
+		/// <param name="progressName"> Name used for the asynchronous progress report </param>
+		public static void RunAsync(IEnumerable<Mesh> meshes, float maxDist, Debugger? debugger, CancellationToken cancellationToken, Scene[] scenes, string progressName)
+		{
+			var meshDefs = meshes.Select(x => new CracksStitching.MeshDef(x)).ToArray();
+			Task.Run(() =>
+			{
+				try
+				{
+					CracksStitching.Run(meshDefs, maxDist, debugger, cancellationToken, scenes, progressName);
+				}
+				catch (Exception e) when (e is not OperationCanceledException)
+				{
+					Debug.LogException(e);
+				}
+			}, cancellationToken);
+		}
 
-            foreach (var o in SolveRaw(mesh.vertices, mesh.triangles, subMeshes, debug, maxDist)){ }
+		static void Run(MeshDef[] meshes, float maxDist, Debugger? debugger, CancellationToken cancellationToken, Scene[] scenes, string progressName)
+		{
+			using var progress = new DisposableProgress(progressName);
 
-            var totalIndices = 0;
-            foreach (var list in subMeshes)
-                totalIndices += list.Count;
-            
-            if(totalIndices > ushort.MaxValue)
-                mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+			// Filter out edges that are part of a surface from those that are on the bounds of the surface or a hole in the surface
+			// We do so by filtering edge whose vertex position are unique as a pair, meaning that their positions are only used by a single triangle
 
-            for (int i = 0; i < subMeshes.Length; i++)
-                mesh.SetTriangles(subMeshes[i], i);
-        }
+			var sharedPosPair = new HashSet<EdgeDef>(new UniquePosPairComparer());
+			var uniquePosPair = new HashSet<EdgeDef>(new UniquePosPairComparer());
+			(int, int)[] edges = new (int, int)[3];
+			foreach (var mesh in meshes)
+			{
+				for (int ofBuffer = 0; ofBuffer < mesh.IndexBuffers.Length; ofBuffer++)
+				{
+					var indexBuffer = mesh.IndexBuffers[ofBuffer];
+					for (int inBuffer = 0; inBuffer < indexBuffer.Count; inBuffer += 3)
+					{
+						edges[0] = (inBuffer, inBuffer+1);
+						edges[1] = (inBuffer+1, inBuffer+2);
+						edges[2] = (inBuffer+2, inBuffer);
+						foreach (var (aInBuffer, bInBuffer) in edges)
+						{
+							EdgeDef edge = new EdgeDef(aInBuffer, bInBuffer, mesh, ofBuffer);
+							if (sharedPosPair.Contains(edge))
+								continue;
 
-        /// <summary>
-        /// Stitch cracks and small holes in meshes, this can take a significant amount of time depending on the mesh.
-        /// </summary>
-        /// <param name="vertices">All vertices of the mesh</param>
-        /// <param name="tris">All geometry indices of the mesh</param>
-        /// <param name="subMeshes">Submeshes geometry indices</param>
-        /// <param name="debug"> An object which will receive debug information </param>
-        /// <param name="maxDist"> The maximum distance to cover when stitching cracks, larger than this will not be stitched </param>
-        /// <param name="pCancellationToken"> Optional cancellation token </param>
-        /// <returns> Yield while solving if the preprocessor has been enabled, otherwise returns empty </returns>
-        public static IEnumerable SolveRaw(Vector3[] vertices, int[] tris, List<int>[] subMeshes, ISolverDebugProvider debug, float maxDist = 0.05f, CancellationToken pCancellationToken = default)
-        {
-            // Merging duplicate vertices to ignore material-specific topology
-            Merge(vertices, out var newVertices, ref tris);
-            
-            pCancellationToken.ThrowIfCancellationRequested();
-            
-            var nativeVertices = vertices;
-            vertices = newVertices;
+							if (uniquePosPair.Add(edge) == false) // Another edge registered itself before, those position pairs are no longer unique
+							{
+								uniquePosPair.Remove(edge);
+								sharedPosPair.Add(edge);
+							}
+						}
+					}
 
-            var allEdges = new HashSet<EdgeId>();
-            var sharedEdges = new HashSet<EdgeId>();
-            
-            // We're thinking of cracks as edges that do not have multiple triangles 
-            for (int i = 0; i < tris.Length; i+=3)
-            {
-                int x = tris[i], y = tris[i + 1], z = tris[i + 2];
-                
-                var edgeA = new EdgeId(x, y);
-                var edgeB = new EdgeId(y, z);
-                var edgeC = new EdgeId(z, x);
-                
-                if (allEdges.Add(edgeA) == false)
-                    sharedEdges.Add(edgeA);
-                if(allEdges.Add(edgeB) == false)
-                    sharedEdges.Add(edgeB);
-                if(allEdges.Add(edgeC) == false)
-                    sharedEdges.Add(edgeC);
-            }
-            
-            pCancellationToken.ThrowIfCancellationRequested();
-            
-            // Only keep edges which do not share multiple triangles
-            var leftToSolve = new HashSet<EdgeId>(allEdges);
-            foreach (var edge in sharedEdges)
-                leftToSolve.Remove(edge);
+					if (cancellationToken.IsCancellationRequested)
+						return;
+				}
+			}
 
-            var trianglesToAdd = new List<(int a, int b, int c)>();
-            var workingData = new WorkingData(trianglesToAdd, allEdges, leftToSolve, vertices);
-            
-            debug?.HookIntoWorkingData(workingData);
+			// Pre-compute best pairs for all edges
 
-            while (leftToSolve.Count > 0)
-            {
-                pCancellationToken.ThrowIfCancellationRequested();
-                
-                // Take one random edge from the hashset
-                EdgeId thisEdge;
-                using (var e = leftToSolve.GetEnumerator())
-                {
-                    e.MoveNext();
-                    thisEdge = e.Current;
-                }
+			{
+				var copy = uniquePosPair.ToArray();
+				for (int i = 0; i < copy.Length; i++)
+				{
+					var edgeA = copy[i];
+					for (int j = i+1; j < copy.Length; j++)
+					{
+						var edgeB = copy[j];
+						ComputeScore(edgeA, edgeB, out float score);
+						edgeA.TryUnsafeInsert(edgeB, score);
+						edgeB.TryUnsafeInsert(edgeA, score);
+					}
+				}
+			}
 
-                if (ReturnBestMatchFor(ref thisEdge, ref workingData, out var bestMatch) == false || bestMatch.dist > maxDist)
-                {
-                    if(bestMatch.dist <= maxDist)
-                        throw new InvalidOperationException($"Stray edge ({thisEdge}) could not be solved for");
-                    
-                    debug?.LogWarning($"For edge {thisEdge}, closest match ({bestMatch.edge}) did not satisfy {nameof(maxDist)} constraint {bestMatch.dist}/{maxDist}");
-                    leftToSolve.Remove(thisEdge);
-                    continue;
-                }
+			// Go through all edges, find the best pair,
+			// create a quad between them, remove those edges from the collection,
+			//  append the two new edges made by the bridge to the collection if necessary
+			// repeat
 
-                // Found a best match for thisEdge but let's check that they are both best matches for each other
-                int swapCount = 0;
-                do
-                {
-                    pCancellationToken.ThrowIfCancellationRequested();
-                    
-                    ReturnBestMatchFor(ref bestMatch.edge, ref workingData, out var otherBestMatch);
-                    if (otherBestMatch.dist > maxDist)
-                    {
-                        debug?.LogWarning($"For edge {bestMatch.edge}, closest match ({otherBestMatch.edge}) did not satisfy {nameof(maxDist)} constraint {otherBestMatch.dist}/{maxDist}");
-                        leftToSolve.Remove(bestMatch.edge);
-                        break;
-                    }
+			int initialUniquePosPair = uniquePosPair.Count;
+			while (uniquePosPair.Count > 0)
+			{
+				EdgeDef? bestEdge = null;
+				float bestEdgeScore = float.NegativeInfinity;
+				foreach (var sourceEdge in uniquePosPair)
+				{
+					if (sourceEdge.BestMatch.Score <= bestEdgeScore)
+						continue;
+					
+					while (uniquePosPair.Contains(sourceEdge.BestMatch.Edge) == false && uniquePosPair.Count > 1)
+						sourceEdge.Evict(sourceEdge.BestMatch.Edge, uniquePosPair);
+					
+					if (sourceEdge.BestMatch.Edge.BestMatch.Edge == sourceEdge)
+					{
+						bestEdge = sourceEdge;
+						bestEdgeScore = sourceEdge.BestMatch.Score;
+					}
+				}
 
-                    if (otherBestMatch.edge == thisEdge || swapCount > 10)
-                    {
-                        if (swapCount > 10)
-                        {
-                            // swapCount prevents very unlikely infinite loop with weird edge topology in
-                            // cases where X's best match is Y but Y's is Z which itself is X
-                            debug?.LogWarning($"Sub par match for {thisEdge} -> {otherBestMatch.edge}");
-                        }
+				if (bestEdge is null)
+				{
+					Debug.LogError("Failed to resolve further");
+					break;
+				}
 
-                        // Both edges are each other's best match
-                        leftToSolve.Remove(thisEdge);
-                        leftToSolve.Remove(bestMatch.edge);
-                        
-                        int index = trianglesToAdd.Count;
-                        CreateTriangles(ref workingData, ref thisEdge, ref bestMatch.edge);
-                        debug?.Log($"{thisEdge} -> {bestMatch.edge}: {trianglesToAdd[index]} {(trianglesToAdd.Count - index > 1 ? trianglesToAdd[index+1].ToString() : "")}");
-                        #if YIELD_SUBSTEPS
-                        yield return null;
-                        #endif
-                        break;
-                    }
-                    else
-                    {
-                        // They don't match, try to see if this new best match matches each other instead
-                        thisEdge = bestMatch.edge;
-                        bestMatch = otherBestMatch;
-                        swapCount++;
-                        #if YIELD_SUBSTEPS
-                        yield return null;
-                        #endif
-                        continue;
-                    }
-                } while (true);
-            }
+				Merge(bestEdge, bestEdge.BestMatch.Edge, uniquePosPair, sharedPosPair, maxDist, debugger);
 
-            var posToSubMesh = new Dictionary<Vector3, (int submesh, int vertIndex)>();
-            for (int subMeshIndex = 0; subMeshIndex < subMeshes.Length; subMeshIndex++)
-            {
-                var subMesh = subMeshes[subMeshIndex];
-                for (int i = 0; i < subMesh.Count; i++)
-                {
-                    var subMeshVertIndex = subMesh[i];
-                    var pos = nativeVertices[subMeshVertIndex];
-                    // Multiple assignment on the same key would matter
-                    // only for large holes next to multiple materials,
-                    // we do not expect cracks to be large enough to warrant solving for this.
-                    posToSubMesh[pos] = (subMeshIndex, subMeshVertIndex);
-                }
-            }
-            
-            pCancellationToken.ThrowIfCancellationRequested();
+				if (cancellationToken.IsCancellationRequested)
+					return;
 
-            foreach (var (x, y, z) in trianglesToAdd)
-            {
-                var (subMeshIndex, mappingA) = posToSubMesh[vertices[x]];
-                var (           _, mappingB) = posToSubMesh[vertices[y]];
-                var (           _, mappingC) = posToSubMesh[vertices[z]];
-                
-                // Effectively randomly picking subMesh, i.e.: material, those triangles will be assigned to, see comment above
-                var indices = subMeshes[subMeshIndex];
-                
-                // Not sure yet how to properly solve winding order, add both sides for now
-                indices.Add(mappingA);
-                indices.Add(mappingB);
-                indices.Add(mappingC);
-                indices.Add(mappingC);
-                indices.Add(mappingB);
-                indices.Add(mappingA);
-            }
-            
-            pCancellationToken.ThrowIfCancellationRequested();
-            
-            #if !YIELD_SUBSTEPS
-                return Array.Empty<System.Object>();
-            #endif
-        }
+				progress.Report(1f - (uniquePosPair.Count / initialUniquePosPair));
+			}
 
-        /// <summary> Duplicate positions are stripped and indices are remapped appropriately </summary>
-        static void Merge(Vector3[] positions, out Vector3[] outPos, ref int[] indices)
-        {
-            var newPos = new List<Vector3>();
-            var posToIndex = new Dictionary<Vector3, int>();
-            for (int i = 0; i < indices.Length; i++)
-            {
-                var oldIndex = indices[i];
-                var pos = positions[oldIndex];
-                if (posToIndex.TryGetValue(pos, out var newIndex) == false)
-                {
-                    newIndex = newPos.Count;
-                    newPos.Add(pos);
-                    posToIndex.Add(pos, newIndex);
-                }
+			if (debugger is not null)
+			{
+				foreach (var edgeDef in uniquePosPair)
+				{
+					debugger.DrawEdge(edgeDef, Color.red, 0f);
+				}
+			}
 
-                indices[i] = newIndex;
-            }
+			foreach (var meshDef in meshes)
+			{
+				foreach (IGrouping<int,(int IndexBuffer, int Start)> grouping in meshDef.ToDiscard.GroupBy(x => x.IndexBuffer))
+				{
+					var indexBuffer = meshDef.IndexBuffers[grouping.Key];
+					foreach ((_, int Start) in grouping.OrderByDescending(x => x.Start))
+					{
+						indexBuffer.RemoveRange(Start, 6);
+					}
+				}
+			}
 
-            outPos = newPos.ToArray();
-        }
+			EditorApplication.CallbackFunction a = null!;
+			a = () =>
+			{
+				EditorApplication.update -= a;
+				ApplyMeshChanges(cancellationToken, meshes, scenes);
+			};
 
-        /// <summary> Create bridge between the given edges, append those new triangles and edges to working data </summary>
-        static void CreateTriangles(ref WorkingData data, ref EdgeId edgeAB, ref EdgeId edgeXY)
-        {
-            (int a, int b) = edgeAB;
-            (int x, int y) = edgeXY;
-        
-            (int a, int b, int x, int dupe)? isTri = null;
-            // Do those two edge share a vertex
-            if (x == a || x == b)
-                isTri = (a, b, y, x);
-            else if (y == a || y == b)
-                isTri = (a, b, x, y);
-            
-            if (isTri.HasValue)
-            {
-                var tri = isTri.Value;
-                data.tris.Add((tri.a, tri.b, tri.x));
-                
-                var newEdge = tri.dupe == a ? new EdgeId(b, tri.x) : new EdgeId(a, tri.x);
-                
-                // Created a triangle from two existing edges, the third one formed by them must now be added to the pool to be solved for
-                if (data.allEdges.Add(newEdge))
-                    data.edgesLeft.Add(newEdge);
-                else
-                    data.edgesLeft.Remove(newEdge);
-            }
-            else
-            {
-                var vertices = data.vertices;
-                var pivot = Vector3.Dot((vertices[b] - vertices[a]).normalized, (vertices[y] - vertices[x]).normalized) >= 0 ? b : a;
-                
-                data.tris.Add((a, b, x));
-                data.tris.Add((x, pivot, y));
+			EditorApplication.update += a;
+		}
 
-                EdgeId newEdge0, newEdge1;
-                if (pivot == b)
-                {
-                    newEdge0 = new EdgeId(a, x);
-                    newEdge1 = new EdgeId(b, y);
-                }
-                else
-                {
-                    newEdge0 = new EdgeId(a, y);
-                    newEdge1 = new EdgeId(b, x);
-                }
-                
-                // Created a quad to bridge those two edges, two new edges were formed through this process and
-                // must now be added to the pool to be solved for.
-                if (data.allEdges.Add(newEdge0))
-                    data.edgesLeft.Add(newEdge0);
-                else            
-                    data.edgesLeft.Remove(newEdge0);
-                if (data.allEdges.Add(newEdge1))
-                    data.edgesLeft.Add(newEdge1);
-                else
-                    data.edgesLeft.Remove(newEdge1);
-            }
-        }
-        
-        static bool ReturnBestMatchFor(ref EdgeId edge, ref WorkingData data, out (float dist, EdgeId edge, Segment seg) output)
-        {
-            var vertices = data.vertices;
-            var edgesLeft = data.edgesLeft;
-            
-            // Prevents testing edge against itself on every iteration of the loop, will be added back lower
-            edgesLeft.Remove(edge);
-            
-            var seg = new Segment(vertices[edge.a], vertices[edge.b]);
-            (float dist, EdgeId edge, Segment seg) closest = (float.PositiveInfinity, default, default);
-            foreach (var otherEdge in edgesLeft)
-            {
-                var otherSeg = new Segment(vertices[otherEdge.a], vertices[otherEdge.b]);
-                ComputeScoreFor(ref seg, ref otherSeg, out var dist);
-                if (dist < closest.dist)
-                    closest = (dist, otherEdge, otherSeg);
-            }
+		static void ApplyMeshChanges(CancellationToken cancellationToken, MeshDef[] meshes, Scene[] scenes)
+		{
+			if (cancellationToken.IsCancellationRequested)
+				return;
 
-            edgesLeft.Add(edge);
+			foreach (var meshDef in meshes)
+			{
+				meshDef.Representation.SetVertices(meshDef.Pos);
+				meshDef.Representation.SetNormals(meshDef.Normals);
+				meshDef.Representation.SetTangents(meshDef.Tangents);
+				meshDef.Representation.SetUVs(0, meshDef.UV1);
+				meshDef.Representation.SetUVs(1, meshDef.UV2);
 
-            output = closest;
-            return closest.dist != float.PositiveInfinity;
-        }
+				for (int i = 0; i < meshDef.IndexBuffers.Length; i++)
+					meshDef.Representation.SetTriangles(meshDef.IndexBuffers[i], i);
+			}
 
-        static void ComputeScoreFor(ref Segment segX, ref Segment segY, out float score)
-        {
-            if (segX.lengthSqr == 0f)
-            {
-                // segX is a point
-                if (segY.lengthSqr == 0f)
-                {
-                    // Both segments are points
-                    score = (segX.a - segY.a).sqrMagnitude;
-                }
-                else
-                {
-                    // segX is a point and segY a segment
-                    var aOnSegB = Vector3.Dot(segX.a - segY.a, segY.delta) / segY.lengthSqr;
-                    score = (segX.a - (segY.a + segY.delta * aOnSegB)).sqrMagnitude;
-                }
-                return;
-            }
-            else if (segY.lengthSqr == 0f)
-            {
-                // Swap segments and let recursion handle this
-                ComputeScoreFor(ref segY, ref segX, out score);
-                return;
-            }
+			foreach (var scene in scenes)
+				EditorSceneManager.MarkSceneDirty(scene);
+		}
 
-            // From here on out, both segments are guaranteed to have a length above zero
+		static void Merge(EdgeDef sourceEdge, EdgeDef targetEdge, HashSet<EdgeDef> uniquePosPair, HashSet<EdgeDef> sharedPosPair, float maxDist, Debugger? debugger)
+		{
+			uniquePosPair.Remove(sourceEdge);
+			uniquePosPair.Remove(targetEdge);
+			sharedPosPair.Add(sourceEdge);
+			sharedPosPair.Add(targetEdge);
 
-            if (segX.lengthSqr > segY.lengthSqr)
-                ComputeScoreInner(ref segX, ref segY, out score);
-            else
-                ComputeScoreInner(ref segY, ref segX, out score);
-        }
-        
-        /// <summary> segX must be longer than segY, swap them if they aren't ! </summary>
-        static void ComputeScoreInner(ref Segment segX, ref Segment segY, out float score)
-        {
-            // this method operates knowing that segY is smaller than segX
+			// Let's draw a quad to join those two edges
 
-            // Find closest point on segmentX from both edges of segmentY
-            // ... now computing factor along segmentX
-            var fA = Vector3.Dot(segY.a - segX.a, segX.delta) / segX.lengthSqr;
-            var fB = Vector3.Dot(segY.b - segX.a, segX.delta) / segX.lengthSqr;
-            // factor may be outside [0,1], meaning that the closest point is outside of the segment along its line
-            var fCA = Mathf.Clamp01(fA);
-            var fCB = Mathf.Clamp01(fB);
-            if (fCA == fA || fCB == fB)
-            {
-                // At least one of the closest pos is on segmentX
-                // Project them both back onto segmentY and find the differences to derive a score
-                // hinting to how skewed the resulting quads/tris bridging those segments would be.
-                // This came mostly through intuition, even if this is flawed, the score is
-                // not nearly as important as validating that both segments are each other's best match.
-                
-                var aOnX = segX.a + segX.delta * fA;
-                var aBack = segY.a + segY.delta * Mathf.Clamp01(Vector3.Dot(aOnX - segY.a, segY.delta) / segY.lengthSqr);
-                var bOnX = segX.a + segX.delta * fB;
-                var bBack = segY.a + segY.delta * Mathf.Clamp01(Vector3.Dot(bOnX - segY.a, segY.delta) / segY.lengthSqr);
-                
-                // Projection to projection distance is rated lower than projection back to vertex
-                // this way edges slightly further away but parallel are preferred over those perpendicular to each other
-                score = ((aOnX - aBack).sqrMagnitude + (bOnX - bBack).sqrMagnitude) * 0.5f
-                        + (segY.a - aBack).sqrMagnitude + (segY.b - bBack).sqrMagnitude;
-                score *= 0.5f;
-            }
-            else
-            {
-                // The segments do not share a plane in common, return distance from edges
-                score = (segX.a - segY.a).sqrMagnitude +
-                        (segX.b - segY.b).sqrMagnitude;
-                score *= 0.5f;
-            }
-        }
+			int indexOppositeA;
+			int indexOppositeB;
+			var dist1 = Vector3.SqrMagnitude(targetEdge.A - sourceEdge.A) + Vector3.SqrMagnitude(targetEdge.B - sourceEdge.B);
+			var dist2 = Vector3.SqrMagnitude(targetEdge.B - sourceEdge.A) + Vector3.SqrMagnitude(targetEdge.A - sourceEdge.B);
+			bool swapIndex = dist1 > dist2; // Figure out which vertices of the edges should get connected when bridging them, a with other a or a with other b
+			if (targetEdge.Mesh != sourceEdge.Mesh) // When the mesh don't match, we'll pick the opposite meshes' vertices and append them to the source's mesh
+			{
+				sourceEdge.Mesh.Pos.Add(targetEdge.Mesh.Pos[targetEdge.IndexA]);
+				sourceEdge.Mesh.Pos.Add(targetEdge.Mesh.Pos[targetEdge.IndexB]);
+				sourceEdge.Mesh.Normals.Add(targetEdge.Mesh.Normals[targetEdge.IndexA]);
+				sourceEdge.Mesh.Normals.Add(targetEdge.Mesh.Normals[targetEdge.IndexB]);
+				sourceEdge.Mesh.Tangents.Add(targetEdge.Mesh.Tangents[targetEdge.IndexA]);
+				sourceEdge.Mesh.Tangents.Add(targetEdge.Mesh.Tangents[targetEdge.IndexB]);
 
-        /// <summary> Provides hooks into the stitching procedure for debug purposes </summary>
-        public interface ISolverDebugProvider
-        {
-            /// <summary>
-            /// Provides a way to hook into the data the solver is working with,
-            /// to read while the solver yields for example.
-            /// Writing to those collections will lead to undefined behaviors.
-            /// </summary>
-            void HookIntoWorkingData(WorkingData data);
-            void LogWarning(string str);
-            void Log(string str);
-        }
+				// Use stuff from source instead, the uvs of target may map to something widely different,
+				// better to stretch the source uvs instead of setting wrong ones
+				var sourceA = swapIndex ? sourceEdge.IndexB : sourceEdge.IndexA;
+				var sourceB = swapIndex ? sourceEdge.IndexA : sourceEdge.IndexB;
+				sourceEdge.Mesh.UV1.Add(sourceEdge.Mesh.UV1[sourceA]);
+				sourceEdge.Mesh.UV1.Add(sourceEdge.Mesh.UV1[sourceB]);
+				if (sourceEdge.Mesh.UV2.Count > 0)
+				{
+					sourceEdge.Mesh.UV2.Add(sourceEdge.Mesh.UV2[sourceA]);
+					sourceEdge.Mesh.UV2.Add(sourceEdge.Mesh.UV2[sourceB]);
+				}
 
-        /// <summary> Deterministic identity for an edge </summary>
-        public readonly struct EdgeId : IEquatable<EdgeId>
-        {
-            /// <summary>
-            /// <see cref="a"/> is guaranteed to be smaller than <see cref="b"/>,
-            /// they are indices to the vertex position buffer.
-            /// </summary>
-            public readonly int a, b;
+				indexOppositeA = sourceEdge.Mesh.Pos.Count - 2;
+				indexOppositeB = sourceEdge.Mesh.Pos.Count - 1;
+			}
+			else
+			{
+				indexOppositeA = targetEdge.IndexA;
+				indexOppositeB = targetEdge.IndexB;
+			}
 
-            public EdgeId(int x, int y)
-            {
-                a = Min(x, y);
-                b = Max(x, y);
-            }
+			if (swapIndex)
+			{
+				(indexOppositeA, indexOppositeB) = (indexOppositeB, indexOppositeA);
+			}
 
-            public void Deconstruct(out int oA, out int oB)
-            {
-                oA = a;
-                oB = b;
-            }
+			var indexBuffer = sourceEdge.Mesh.IndexBuffers[sourceEdge.IndexBuffer];
 
-            public static bool operator ==(EdgeId x, EdgeId y) => x.a == y.a && x.b == y.b;
-            public static bool operator !=(EdgeId x, EdgeId y) => x.a != y.a || x.b != y.b;
+			int baseIndex = indexBuffer.Count;
+			indexBuffer.Add(0);
+			indexBuffer.Add(0);
+			indexBuffer.Add(0);
 
-            public bool Equals(EdgeId other) => a == other.a && b == other.b;
-            public override bool Equals(object obj) => obj is EdgeId other && Equals(other);
-            public override int GetHashCode() => (a, b).GetHashCode();
-            public override string ToString() => (a, b).ToString();
-        }
+			indexBuffer.Add(0);
+			indexBuffer.Add(0);
+			indexBuffer.Add(0);
 
-        public readonly struct WorkingData
-        {
-            public readonly List<(int, int, int)> tris;
-            public readonly HashSet<EdgeId> allEdges;
-            public readonly HashSet<EdgeId> edgesLeft;
-            public readonly Vector3[] vertices;
+			ComputeScore(sourceEdge, targetEdge, out _, out float distanceA, out float distanceB);
+			bool discard = distanceB > maxDist && distanceA > maxDist;
+			if (discard)
+				sourceEdge.Mesh.ToDiscard.Add((sourceEdge.IndexBuffer, baseIndex));
 
-            public WorkingData(
-                List<(int, int, int)> pTris, 
-                HashSet<EdgeId> pAllEdges, 
-                HashSet<EdgeId> pEdgesLeft, 
-                Vector3[] pVertices)
-            {
-                tris = pTris;
-                allEdges = pAllEdges;
-                edgesLeft = pEdgesLeft;
-                vertices = pVertices;
-            }
-        }
+			// This nonsense is to ensure that winding is correct,
+			//  When two triangles share the same edge, their winding passes through the two vertices they share in opposite direction,
+			//  e.g.: for vertices {a,b,c,d} one triangle goes {a,b,c} the other goes {b,a,d}:
+			//          A
+			//        ↙╮┆╭←
+			//      ↙  ↑┆↓  ↖
+			//    ↙    ↑┆↓    ↖
+			// B ╰┈→┈→┈╯┴╰→┈┈→┈╯ C
+			//          D
 
-        readonly struct Segment
-        {
-            public readonly Vector3 a, b, delta;
-            public readonly float lengthSqr;
+			// Knowing that, we can figure out the winding for those two new triangles by copying the winding of the triangle the source edge is on
 
-            public Segment(Vector3 pA, Vector3 pB)
-            {
-                a = pA;
-                b = pB;
-                delta = pB - pA;
-                lengthSqr = delta.sqrMagnitude;
-            }
-        }
+			int aOrder = sourceEdge.IndexAInBuffer % 3; // is 'a' the first, second or third element in the source triangle
+			int bOrder = sourceEdge.IndexBInBuffer % 3; // is 'b' the first, second or third element in the source triangle
+			int cOrder = 3 - (aOrder + bOrder); // Which spot has not been taken by the two others
 
-        public static void SolveAsync(Mesh[] pMesh, ISolverDebugProvider debug, CancellationToken cancellationToken, Action onFinished, float maxDist = 0.05f)
-        {
-            Mesh combinedMesh = new Mesh();
+			// Add the triangle that lays right against sourceEdge in opposite winding order ('2 - x' reverses winding) see comment above why
+			indexBuffer[baseIndex + (2 - aOrder)] = sourceEdge.IndexA;
+			indexBuffer[baseIndex + (2 - bOrder)] = sourceEdge.IndexB;
+			indexBuffer[baseIndex + (2 - cOrder)] = indexOppositeB;
 
-            var combineInstances = new List<CombineInstance>();
-            foreach (var mesh1 in pMesh)
-                for (int i = 0; i < mesh1.subMeshCount; i++)
-                    combineInstances.Add(new CombineInstance{ mesh = mesh1, subMeshIndex = i });
-            
-            combinedMesh.CombineMeshes(combineInstances.ToArray(), false, false);
+			// Add the other triangle in normal winding order
+			indexBuffer[baseIndex + 3 + aOrder] = indexOppositeA;
+			indexBuffer[baseIndex + 3 + bOrder] = indexOppositeB;
+			indexBuffer[baseIndex + 3 + cOrder] = sourceEdge.IndexA;
 
-            var verts = combinedMesh.vertices;
-            var indices = combinedMesh.triangles;
-            
-            var subMeshes = new List<int>[combinedMesh.subMeshCount];
-            for (int i = 0; i < combinedMesh.subMeshCount; i++)
-                subMeshes[i] = combinedMesh.GetTriangles(i).ToList();
-            
-            System.Threading.Tasks.Task.Run(() =>
-            {
-                try
-                {
-                    foreach (var o in SolveRaw(verts, indices, subMeshes, debug, maxDist)){ }
+			// Now that we created a bridge between the two edges, we need to add the two new edges we just created
+			var aToOppositeA = new EdgeDef(baseIndex + 3 + aOrder, baseIndex + 3 + cOrder, sourceEdge.Mesh, sourceEdge.IndexBuffer);
+			var bToOppositeB = new EdgeDef(baseIndex + (2 - bOrder), baseIndex + (2 - cOrder), sourceEdge.Mesh, sourceEdge.IndexBuffer);
 
-                    cancellationToken.ThrowIfCancellationRequested();
-                        
-                    var totalIndices = 0;
-                    foreach (var list in subMeshes)
-                        totalIndices += list.Count;
-                    
-                    // Mesh is not thread safe, we can run the process asynchronously as long as we don't directly interact with mesh.
-                    //   to that end we're relying on the editor update callback to apply those changes back, but inline delegates cannot remove
-                    //   themselves from a callback -> using a class to hold the delegate reference which removes itself after the call to work around this.
-                    var jobWorkAround = new AsyncJobWorkaround();
-                    EditorApplication.update += jobWorkAround.Post = () =>
-                    {
-                        EditorApplication.update -= jobWorkAround.Post;
-                        if(cancellationToken.IsCancellationRequested)
-                            return;
-            
-                        if(totalIndices > ushort.MaxValue)
-                            combinedMesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+			//             aToOppositeA
+			//                  ↓
+			//            A ┬───────┬ oppositeA
+			//              │ ╲     │
+			// sourceEdge → │   ╲   │ ← targetEdge
+			//              │     ╲ │
+			//            B ┴───────┴ oppositeB
+			//                  ↑
+			//            bToOppositeB
 
-                        for (int i = 0; i < subMeshes.Length; i++)
-                            combinedMesh.SetTriangles(subMeshes[i], i);
+			if (debugger is not null)
+			{
+				if (discard)
+				{
+					debugger.DrawEdge(sourceEdge, Color.red);
+					debugger.DrawEdge(targetEdge, Color.red);
+					debugger.DrawEdge(aToOppositeA, Color.red);
+					debugger.DrawEdge(bToOppositeB, Color.red);
+				}
+				else
+				{
+					debugger.DrawEdge(sourceEdge, Color.blue);
+					debugger.DrawEdge(targetEdge, Color.green);
+					debugger.DrawEdge(aToOppositeA, Color.cyan);
+					debugger.DrawEdge(bToOppositeB, Color.cyan);
+				}
+			}
 
-                        // Redistribute data to the right meshes
-                        int submeshIndex = 0;
-                        foreach (var mesh1 in pMesh)
-                        {
-                            var ci = new CombineInstance[mesh1.subMeshCount];
-                            mesh1.Clear(); 
-                            for (int i = 0; i < ci.Length; i++)
-                                ci[i] = new CombineInstance { mesh = combinedMesh, subMeshIndex = submeshIndex++ };
-                            mesh1.CombineMeshes(ci, false, false);
-                            // CombineMeshes dumps all vertex data from all referenced meshes into the resulting mesh
-                            // even if most of the vertex data ends up unused because those vertices' are not referenced in the index/triangle array
-                            mesh1.OptimizeReorderVertexBuffer();
-                        }
+			if (aToOppositeA.A.Equals(aToOppositeA.B) == false && sharedPosPair.Contains(aToOppositeA) == false)
+			{
+				if (uniquePosPair.Add(aToOppositeA))
+				{
+					foreach (var otherOtherCache in uniquePosPair)
+					{
+						if (ReferenceEquals(aToOppositeA, otherOtherCache))
+							continue;
 
-                        onFinished?.Invoke();
-                    };
-                }
-                catch (Exception e) when(e is OperationCanceledException == false)
-                {
-                    Debug.LogException(e);
-                }
-            }, cancellationToken);
-        }
+						ComputeScore(aToOppositeA, otherOtherCache, out var score);
+						aToOppositeA.TryUnsafeInsert(otherOtherCache, score);
+						otherOtherCache.TryGuardedInsert(aToOppositeA, score);
+					}
+				}
+				else // It already exists, meaning that we just solved another edge at the same time as this one
+				{
+					uniquePosPair.TryGetValue(aToOppositeA, out aToOppositeA); // may not map exactly and we need the exact ref for eviction
+					uniquePosPair.Remove(aToOppositeA);
+					sharedPosPair.Add(aToOppositeA);
+				}
+			}
 
-        class AsyncJobWorkaround
-        {
-            public EditorApplication.CallbackFunction Post;
-        }
-    }
+			if (bToOppositeB.A.Equals(bToOppositeB.B) == false && sharedPosPair.Contains(bToOppositeB) == false)
+			{
+				if (uniquePosPair.Add(bToOppositeB))
+				{
+					foreach (var otherOtherCache in uniquePosPair)
+					{
+						if (ReferenceEquals(bToOppositeB, otherOtherCache))
+							continue;
+
+						ComputeScore(bToOppositeB, otherOtherCache, out var score);
+						bToOppositeB.TryUnsafeInsert(otherOtherCache, score);
+						otherOtherCache.TryGuardedInsert(bToOppositeB, score);
+					}
+				}
+				else // It already exists, meaning that we just solved another edge at the same time as this one
+				{
+					uniquePosPair.TryGetValue(bToOppositeB, out bToOppositeB); // may not map exactly and we need the exact ref for eviction
+					uniquePosPair.Remove(bToOppositeB);
+					sharedPosPair.Add(bToOppositeB);
+				}
+			}
+		}
+
+		static void ComputeScore(EdgeDef edge1, EdgeDef edge2, out float score)
+		{
+			ComputeScore(edge1, edge2, out float matchLength, out float distanceA, out float distanceB);
+			// This is the most important line in the whole file
+			// Measure the length of the match, the 1/x here to ensure the longer the match is the closer the difference is to zero
+			score = matchLength;
+			score /= 1f + (distanceA + distanceB); // Divide by projection distance, we don't want to prioritize edges that are similar but far away
+		}
+
+		static void ComputeScore(EdgeDef edge1, EdgeDef edge2, out float matchLength, out float distanceA, out float distanceB)
+		{
+			EdgeDef smallest;
+			EdgeDef largest;
+			if (edge1.AToB.sqrMagnitude > edge2.AToB.sqrMagnitude)
+			{
+				smallest = edge2;
+				largest = edge1;
+			}
+			else
+			{
+				smallest = edge1;
+				largest = edge2;
+			}
+
+			// This is the heart of the algorithm
+			// Here we're computing how close the two edges match by removing the parts of the two segments that don't touch and measuring it
+			// ──────     x
+			//      ────  y
+			//      ─     subSegment
+			var subSegment = (a:largest.A, b:largest.B);
+			ClipBetweenSegment(ref subSegment.a, smallest.A, smallest.AToB);
+			ClipBetweenSegment(ref subSegment.b, smallest.A, smallest.AToB);
+
+			var alongLargest = (a:smallest.A, b:smallest.B);
+			ClipBetweenSegment(ref alongLargest.a, largest.A, largest.AToB);
+			ClipBetweenSegment(ref alongLargest.b, largest.A, largest.AToB);
+
+			matchLength = (subSegment.a - subSegment.b).sqrMagnitude;
+			distanceA = (alongLargest.a - smallest.A).sqrMagnitude;
+			distanceB = (alongLargest.b - smallest.B).sqrMagnitude;
+		}
+
+		/// <summary>
+		/// Take a point and move it to the closest point on segment
+		/// </summary>
+		static void ClipBetweenSegment(ref Vector3 point, Vector3 segmentPos, Vector3 segmentDelta)
+		{
+			var delta = point - segmentPos;
+			float dot = Vector3.Dot(delta, segmentDelta);
+			if (dot < 0)
+			{
+				point = segmentPos;
+			}
+			else
+			{
+				float segDot = Vector3.Dot(segmentDelta, segmentDelta);
+				Vector3 projection;
+				if (segDot == 0f)
+					projection = Vector3.zero;
+				else
+					projection = segmentDelta * (dot / segDot);
+
+				if (projection.sqrMagnitude > segmentDelta.sqrMagnitude)
+					point = segmentPos + segmentDelta;
+				else
+					point = segmentPos + projection;
+			}
+		}
+
+		public class MeshDef
+		{
+			public readonly Mesh Representation;
+			public readonly List<Vector3> Pos;
+			public readonly List<Vector3> Normals;
+			public readonly List<Vector4> Tangents;
+			public readonly List<Vector2> UV1, UV2;
+			public readonly List<int>[] IndexBuffers;
+			public readonly List<(int IndexBuffer, int Start)> ToDiscard = new();
+
+			public MeshDef(Mesh mesh)
+			{
+				Representation = mesh;
+				var vertCount = mesh.vertexCount;
+				Pos = new(vertCount);
+				Normals = new(vertCount);
+				Tangents = new(vertCount);
+				UV1 = new(vertCount);
+				UV2 = new(vertCount);
+				mesh.GetVertices(Pos);
+				mesh.GetNormals(Normals);
+				mesh.GetTangents(Tangents);
+				mesh.GetUVs(0, UV1);
+				mesh.GetUVs(1, UV2);
+				IndexBuffers = new List<int>[mesh.subMeshCount];
+				for (int i = 0; i < mesh.subMeshCount; i++)
+				{
+					var tris = new List<int>(vertCount);
+					mesh.GetTriangles(tris, i);
+					IndexBuffers[i] = tris;
+				}
+			}
+		}
+
+		public class EdgeDef
+		{
+			const int CacheSizeMax = 4;
+
+			public readonly Vector3 A;
+			public readonly Vector3 B;
+			public readonly Vector3 AToB;
+			public readonly int IndexA;
+			public readonly int IndexB;
+			public readonly int IndexBuffer;
+			public readonly int IndexAInBuffer;
+			public readonly int IndexBInBuffer;
+			public readonly MeshDef Mesh;
+
+			private readonly (EdgeDef Edge, float Score)[] BestMatches;
+
+			private int _bestMatchesCount;
+
+			/// <remarks>
+			/// May not be entirely valid if the amount of edges in the pool
+			/// is less than two or of nothing was happended to it yet
+			/// </remarks>
+			public (EdgeDef Edge, float Score) BestMatch => BestMatches[0];
+
+			public EdgeDef(int indexAInBuffer, int indexBInBuffer, MeshDef mesh, int indexBuffer)
+			{
+				BestMatches = new (EdgeDef Edge, float Score)[CacheSizeMax];
+				var indexA = mesh.IndexBuffers[indexBuffer][indexAInBuffer];
+				var indexB = mesh.IndexBuffers[indexBuffer][indexBInBuffer];
+				Vector3 a = mesh.Pos[indexA];
+				Vector3 b = mesh.Pos[indexB];
+
+				IndexBuffer = indexBuffer;
+				Mesh = mesh;
+
+				bool ordered = false;
+				if (a.x < b.x)
+				{
+					ordered = true;
+				}
+				else if (a.x == b.x)
+				{
+					if (a.y < b.y || (a.y == b.y && a.z < b.z))
+						ordered = true;
+				}
+
+				// Ordering to guarantee deterministic comparison and hashcode given the same pair but in different order
+				// See UniquePosPairComparer for usage
+				A = ordered ? a : b;
+				B = ordered ? b : a;
+				IndexA = ordered ? indexA : indexB;
+				IndexB = ordered ? indexB : indexA;
+				IndexAInBuffer = ordered ? indexAInBuffer : indexBInBuffer;
+				IndexBInBuffer = ordered ? indexBInBuffer : indexAInBuffer;
+				AToB = B - A;
+			}
+
+			/// <summary>
+			/// Insert this edge in the cache, should only be used when rebuilding this edge's cache entirely
+			/// </summary>
+			public void TryUnsafeInsert(EdgeDef otherEdge, float score)
+			{
+				if (_bestMatchesCount == 0)
+				{
+					BestMatches[_bestMatchesCount++] = (otherEdge, score);
+					return;
+				}
+				else if (score >= BestMatches[0].Score)
+				{
+					for (int i = Math.Min(_bestMatchesCount - 1, CacheSizeMax - 2); i >= 0; i--)
+						BestMatches[i + 1] = BestMatches[i];
+					_bestMatchesCount = Math.Min(_bestMatchesCount + 1, CacheSizeMax);
+					BestMatches[0] = (otherEdge, score);
+				}
+				else
+				{
+					for (int i = _bestMatchesCount - 1; i >= 0; i--)
+					{
+						if (score > BestMatches[i].Score)
+							continue;
+
+						if (i+1 == CacheSizeMax)
+							return;
+
+						for (int j = Math.Min(_bestMatchesCount - 1, CacheSizeMax - 2); j >= i + 1; j--)
+							BestMatches[j + 1] = BestMatches[j];
+						_bestMatchesCount = Math.Min(_bestMatchesCount + 1, CacheSizeMax);
+
+						BestMatches[i+1] = (otherEdge, score);
+						break;
+					}
+				}
+			}
+
+			/// <summary>
+			/// Try to append a newly introduced edge into the cache
+			/// </summary>
+			public void TryGuardedInsert(EdgeDef otherEdge, float score)
+			{
+				// Here we have to be very careful, if the cache is not filled up, any empty slot just means that we have no clue which edge *should* be in that slot
+				// We can't insert this new edges at an empty spot since it may be misleading, they may not actually be the fourth closest edge,
+				// another one in the pool that was the sixth at the time may very well be the fourth now that a couple of the closest one were evicted.
+				// We just haven't re-filled the cache since then as we didn't need to
+
+				if (_bestMatchesCount == 0)
+					return;
+
+				// Note the lack of 'if (BestEdges.Count == 0)', this wouldn't ever be hit given the if above
+
+				// We can only insert in slots before the last *existing* value, not the one before the maximum amount of slots, see larger comment above
+				if (score < BestMatches[_bestMatchesCount-1].Score)
+					return; // So exit if we're larger than the last value
+
+				if (score >= BestMatches[0].Score)
+				{
+					for (int i = Math.Min(_bestMatchesCount - 1, CacheSizeMax - 2); i >= 0; i--)
+						BestMatches[i + 1] = BestMatches[i];
+					_bestMatchesCount = Math.Min(_bestMatchesCount + 1, CacheSizeMax);
+					BestMatches[0] = (otherEdge, score);
+				}
+				else
+				{
+					for (int i = _bestMatchesCount - 1; i >= 0; i--)
+					{
+						if (score > BestMatches[i].Score)
+							continue;
+
+						if (i + 1 == CacheSizeMax)
+							return;
+
+						for (int j = Math.Min(_bestMatchesCount - 1, CacheSizeMax - 2); j >= i + 1; j--)
+							BestMatches[j + 1] = BestMatches[j];
+						_bestMatchesCount = Math.Min(_bestMatchesCount + 1, CacheSizeMax);
+						
+						BestMatches[i + 1] = (otherEdge, score);
+						break;
+					}
+				}
+			}
+
+			/// <summary>
+			/// Evict an edge from the cache, potentially triggering the cache to be rebuilt
+			/// </summary>
+			public void Evict(EdgeDef edge, HashSet<EdgeDef> uniquePosPair)
+			{
+				for (int i = 0; i < _bestMatchesCount; i++)
+				{
+					if (ReferenceEquals(BestMatches[i].Edge, edge))
+					{
+						for (int j = i; j < _bestMatchesCount-1; j++)
+							BestMatches[j] = BestMatches[j+1];
+						_bestMatchesCount--;
+						break;
+					}
+				}
+
+				if (_bestMatchesCount == 0)
+				{
+					foreach (var otherEdge in uniquePosPair)
+					{
+						if (ReferenceEquals(otherEdge, this))
+							continue;
+
+						ComputeScore(this, otherEdge, out var score);
+						TryUnsafeInsert(otherEdge, score);
+					}
+				}
+			}
+		}
+
+		public class Debugger
+		{
+			public List<(Vector3 a, Vector3 b, Color color)> DebugLines = new();
+
+			public void DrawEdge(EdgeDef edge, Color color, float offset = 0.01f)
+			{
+				var pos = edge.Mesh.Pos;
+				var norms = edge.Mesh.Normals;
+				var p0 = pos[edge.IndexA] + norms[edge.IndexA] * offset;
+				var p1 = pos[edge.IndexB] + norms[edge.IndexB] * offset;
+				DebugLines.Add((p0, p1, color));
+			}
+		}
+
+		class UniquePosPairComparer : IEqualityComparer<EdgeDef>
+		{
+			public bool Equals(EdgeDef x, EdgeDef y)
+			{
+				return x.A.Equals(y.A) && x.B.Equals(y.B); // Using Vector3.Equals instead of '==' as the latter is not an exact equality, which we definitely want since we're resolving precision issues
+			}
+
+			public int GetHashCode(EdgeDef obj)
+			{
+				return HashCode.Combine(obj.A, obj.B);
+			}
+		}
+
+		class DisposableProgress : IDisposable
+		{
+			private int progressId;
+
+			public DisposableProgress(string name)
+			{
+				progressId = Progress.Start(name);
+			}
+
+			public void Report(float value)
+			{
+				Progress.Report(progressId, value);
+			}
+
+			public void Dispose()
+			{
+				Progress.Remove(progressId);
+			}
+		}
+	}
 }
