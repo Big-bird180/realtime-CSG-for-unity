@@ -212,7 +212,6 @@ namespace RealtimeCSG
             bool?	DoNotRender				= (Settings & ModelSettingsFlags.DoNotRender) == ModelSettingsFlags.DoNotRender;
             bool?	TwoSidedShadows			= (Settings & ModelSettingsFlags.TwoSidedShadows) == ModelSettingsFlags.TwoSidedShadows;
 //			bool?	ReceiveShadows			= !((settings & ModelSettingsFlags.DoNotReceiveShadows) == ModelSettingsFlags.DoNotReceiveShadows);
-	        bool?	AutoStitchCracks        = (Settings & ModelSettingsFlags.AutoStitchCracks) == ModelSettingsFlags.AutoStitchCracks;
             bool?	AutoRebuildUVs          = (Settings & ModelSettingsFlags.AutoRebuildUVs) == ModelSettingsFlags.AutoRebuildUVs;
             bool?	PreserveUVs             = (Settings & ModelSettingsFlags.PreserveUVs) == ModelSettingsFlags.PreserveUVs;
             bool?	StitchLightmapSeams     = (Settings & ModelSettingsFlags.StitchLightmapSeams) == ModelSettingsFlags.StitchLightmapSeams;
@@ -267,7 +266,6 @@ namespace RealtimeCSG
                 bool	currDoNotRender				= (Settings & ModelSettingsFlags.DoNotRender) == ModelSettingsFlags.DoNotRender;
                 bool	currTwoSidedShadows			= (Settings & ModelSettingsFlags.TwoSidedShadows) == ModelSettingsFlags.TwoSidedShadows;
 //				bool	currReceiveShadows			= !((settings & ModelSettingsFlags.DoNotReceiveShadows) == ModelSettingsFlags.DoNotReceiveShadows);
-	            bool	currAutoStitchCracks		= (Settings & ModelSettingsFlags.AutoStitchCracks) == ModelSettingsFlags.AutoStitchCracks;
                 bool	currAutoRebuildUVs			= (Settings & ModelSettingsFlags.AutoRebuildUVs) == ModelSettingsFlags.AutoRebuildUVs;
                 bool	currPreserveUVs				= (Settings & ModelSettingsFlags.PreserveUVs) == ModelSettingsFlags.PreserveUVs;
                 bool	currStitchLightmapSeams		= (Settings & ModelSettingsFlags.StitchLightmapSeams) == ModelSettingsFlags.StitchLightmapSeams;
@@ -305,7 +303,6 @@ namespace RealtimeCSG
                 if (TwoSidedShadows			.HasValue && TwoSidedShadows		.Value != currTwoSidedShadows		) TwoSidedShadows = null;
 //				if (ReceiveShadows			.HasValue && ReceiveShadows			.Value != currReceiveShadows		) ReceiveShadows = null;
 //				if (ShadowCastingMode		.HasValue && ShadowCastingMode		.Value != currShadowCastingMode		) ShadowCastingMode = null;
-	            if (AutoStitchCracks     	.HasValue && AutoStitchCracks     	.Value != currAutoStitchCracks		) AutoStitchCracks = null;
                 if (AutoRebuildUVs     		.HasValue && AutoRebuildUVs     	.Value != currAutoRebuildUVs		) AutoRebuildUVs = null;
                 if (PreserveUVs     		.HasValue && PreserveUVs     		.Value != currPreserveUVs	    	) PreserveUVs = null;
                 if (StitchLightmapSeams		.HasValue && StitchLightmapSeams	.Value != currStitchLightmapSeams	) StitchLightmapSeams = null;
@@ -1132,27 +1129,6 @@ namespace RealtimeCSG
                             // Workaround for unity not refreshing the hierarchy when changing hideflags
                             EditorApplication.RepaintHierarchyWindow();
                             EditorApplication.DirtyHierarchyWindowSorting();
-                        }
-                        {
-	                        var autoStitchCracks = AutoStitchCracks ?? false;
-	                        EditorGUI.BeginChangeCheck();
-	                        {
-		                        EditorGUI.showMixedValue = !AutoStitchCracks.HasValue;
-		                        autoStitchCracks = EditorGUILayout.Toggle(StitchCracksContent, autoStitchCracks);
-	                        }
-	                        if (EditorGUI.EndChangeCheck())
-	                        {
-		                        for (int i = 0; i < models.Length; i++)
-		                        {
-			                        if (autoStitchCracks)
-				                        models[i].Settings |= ModelSettingsFlags.AutoStitchCracks;
-			                        else
-				                        models[i].Settings &= ~ModelSettingsFlags.AutoStitchCracks;
-			                        MeshInstanceManager.Refresh(models[i], onlyFastRefreshes: false);
-		                        }
-		                        GUI.changed = true;
-		                        AutoStitchCracks = autoStitchCracks;
-	                        }
                         }
 
 #if UNITY_2017_3_OR_NEWER
